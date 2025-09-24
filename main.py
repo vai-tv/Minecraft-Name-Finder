@@ -1,9 +1,12 @@
 import argparse
 import logging
 import os
+import random
 import requests
+import time
 import concurrent.futures
 
+from tqdm import tqdm
 from typing import Literal
 
 ####################################################################################################
@@ -43,7 +46,7 @@ formats = {
 }
 
 handler = logging.StreamHandler()
-handler.setFormatter(LevelFormatter(formats, datefmt="%Y-%m-%d %H:%M:%S"))
+handler.setFormatter(LevelFormatter(formats, datefmt="%H:%M:%S"))
 
 logger = logging.getLogger()
 # Set log level based on verbose flag - only show INFO and above unless verbose is enabled
@@ -56,14 +59,17 @@ logger.addHandler(handler)
 class NameFinder:
 
     URL = "https://api.mojang.com/users/profiles/minecraft/{}"
+    BATCH_URL = "https://api.mojang.com/profiles/minecraft"
+    BATCH_SIZE = 10
+    BATCH_WAIT_TIME = 0.1
 
     LEGAL_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_"
 
-    AVAIALBLE = 1
-    UNAVAILABLE = 0
-    UNKNOWN = -1
-    ILLEGAL = -2
     AvailabilityCode = Literal[1, 0, -1, -2]
+    AVAIALBLE: AvailabilityCode =    1
+    UNAVAILABLE: AvailabilityCode =  0
+    UNKNOWN: AvailabilityCode =     -1
+    ILLEGAL: AvailabilityCode =     -2
 
     @staticmethod
     def parselist() -> list[str]:
@@ -105,7 +111,7 @@ class NameFinder:
             case 404:
                 return cls.AVAIALBLE
             case 429:
-                logging.error("API rate limit exceeded. Please try again later.")
+                logging.error(f"API rate limit exceeded! Couldn't check {name}.")
                 return cls.UNKNOWN
             case 402:
                 return cls.AVAIALBLE
@@ -113,6 +119,84 @@ class NameFinder:
                 logging.error(f"Unknown status code: {status_code}")
                 return cls.UNKNOWN
     
+    @classmethod
+    def isavailable_batch(cls, names: list[str]) -> list[AvailabilityCode]:
+        results: list[NameFinder.AvailabilityCode] = [cls.UNKNOWN] * len(names)
+        MAX_RETRIES = 5
+        BASE_WAIT = 1.0  # seconds
+
+        # top-level progress bar
+        with tqdm(total=len(names), unit="names", desc="Checking names") as pbar:
+            for i in range(0, len(names), cls.BATCH_SIZE):
+                chunk = names[i:i+cls.BATCH_SIZE]
+                legal_chunk = [n for n in chunk if cls.islegal(n)]
+
+                # mark illegal names immediately
+                for j, n in enumerate(chunk, start=i):
+                    if not cls.islegal(n):
+                        results[j] = cls.ILLEGAL
+                        pbar.update(1)
+
+                if not legal_chunk:
+                    continue
+
+                # try sending batch with retries
+                retries = 0
+                r = None
+                while retries <= MAX_RETRIES:
+                    try:
+                        r = requests.post(cls.BATCH_URL, json=legal_chunk)
+                    except requests.RequestException as e:
+                        logging.error(f"Batch request failed: {e}")
+                        wait = BASE_WAIT * (2 ** retries) + random.uniform(0, 0.5)
+                        time.sleep(wait)
+                        retries += 1
+                        continue
+
+                    if r.status_code == 200:
+                        break  # success
+                    elif r.status_code == 429:
+                        # read Retry-After if Mojang sends it
+                        retry_after = r.headers.get("Retry-After")
+                        if retry_after:
+                            wait = float(retry_after)
+                        else:
+                            # exponential backoff with jitter
+                            wait = BASE_WAIT * (2 ** retries) + random.uniform(0, 0.5)
+                        logging.warning(f"429 Rate limit hit. Waiting {wait:.2f}s before retrying batch {legal_chunk}.")
+                        time.sleep(wait)
+                        retries += 1
+                        continue
+                    elif r.status_code == 400:
+                        logging.error(f"400 Bad Request: {legal_chunk}")
+                        break
+                    else:
+                        logging.error(f"Unexpected status {r.status_code} for batch {legal_chunk}")
+                        logging.error(r.text)
+                        break
+
+                # if we never succeeded, mark unknown
+                if retries > MAX_RETRIES or r is None or r.status_code != 200:
+                    for j, n in enumerate(chunk, start=i):
+                        if results[j] != cls.ILLEGAL:
+                            results[j] = cls.UNKNOWN
+                            pbar.update(1)
+                    continue
+
+                # process successful response
+                found_profiles = {p["name"].lower() for p in r.json()}
+                for j, n in enumerate(chunk, start=i):
+                    if results[j] == cls.ILLEGAL:
+                        continue
+                    results[j] = cls.UNAVAILABLE if n.lower() in found_profiles else cls.AVAIALBLE
+                    pbar.update(1)
+
+                # small delay to reduce likelihood of 429
+                time.sleep(cls.BATCH_WAIT_TIME or 0.1)
+
+        return results
+
+
     @staticmethod
     def isavailable_threaded(names: list[str]) -> list[AvailabilityCode]:
         """
@@ -178,7 +262,7 @@ def main():
             logging.error(f"File \"{args.list}\" not found.")
             exit(1)
 
-        availability = NameFinder.isavailable_threaded(namelist)
+        availability = NameFinder.isavailable_batch(namelist)
 
         for i, (name, available) in enumerate(zip(namelist, availability)):
             print(NameFinder.format_result(name, available), end="\t")
